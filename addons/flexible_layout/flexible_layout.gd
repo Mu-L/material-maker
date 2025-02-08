@@ -1,25 +1,38 @@
 extends Control
 
 
-class FlexPanel:
-	var name : String
-	var widget : Control
-
-
 class FlexNode:
+	extends RefCounted
 	var type : String
-	var parent : FlexNode = null
-	var flexible_layout : Control
+	var parent : WeakRef
+	var flexible_layout : FlexLayout
 	var rect : Rect2 = Rect2(0, 0, 1000, 1000)
 	
-	func _init(p : FlexNode = null,fl : Control = null):
-		type = "FlexNode"
-		parent = p
+	func _init(p : FlexNode = null, fl : FlexLayout = null, t = "FlexNode"):
+		assert(fl != null)
+		type = t
+		parent = weakref(p)
 		flexible_layout = fl
 	
 	func _notification(what):
 		if what == NOTIFICATION_PREDELETE:
-			print("removing %s!" % type)
+			print("removing %s (%s)!" % [ self, type ])
+			return
+			if parent.get_ref() != null:
+				parent.get_ref().replace(self, null)
+	
+	func get_minimum_size() -> Vector2i:
+		assert(false)
+		return Vector2i(0, 0)
+	
+	func serialize() -> Dictionary:
+		var rv : Dictionary = { type=type, w=rect.size.x, h=rect.size.y, children=[] }
+		for c in get_children():
+			rv.children.append(c.serialize())
+		return rv
+	
+	func deserialize(data : Dictionary):
+		rect = Rect2(0, 0, data.w, data.h)
 	
 	func get_children() -> Array[FlexNode]:
 		return []
@@ -39,30 +52,30 @@ class FlexNode:
 
 
 class PanelInfo:
-	var flex_node : FlexNode
-	var flex_panel : FlexPanel
+	var flex_panel : Control
 	
-	func _init(fn : FlexNode, fp : FlexPanel):
-		flex_node = fn
+	func _init(fp : Control):
 		flex_panel = fp
-		flex_node.flexible_layout.start_drag()
+		flex_panel.get_meta("flex_layout").start_drag()
 	
 	func _notification(what):
 		if what == NOTIFICATION_PREDELETE:
-			print("Goodbye!")
-			flex_node.flexible_layout.end_drag()
+			flex_panel.get_meta("flex_layout").end_drag()
 
 
 class FlexTop:
 	extends FlexNode
-	var control : Control
 	var child : FlexNode = null
 	
-	func _init(fl : Control, c : Control = null):
-		type = "FlexTop"
-		control = c if c else fl
-		parent = null
-		flexible_layout = fl
+	func _init(fl : FlexLayout):
+		super._init(null, fl, "FlexTop")
+	
+	func get_minimum_size() -> Vector2i:
+		return child.get_minimum_size() if child else Vector2i(0, 0)
+	
+	func deserialize(data : Dictionary):
+		super.deserialize(data)
+		child = flexible_layout.deserialize(self, data.children[0])
 	
 	func get_children() -> Array[FlexNode]:
 		if child:
@@ -77,9 +90,10 @@ class FlexTop:
 			return false
 		if new_fn:
 			child = new_fn
-			new_fn.parent = self
+			new_fn.parent = weakref(self)
 		else:
 			child = null
+			flexible_layout.delete_subwindow()
 		return true
 	
 	func layout(r : Rect2):
@@ -96,9 +110,42 @@ class FlexSplit:
 	
 	const DRAGGER_SCENE = preload("res://addons/flexible_layout/flexible_dragger.tscn")
 	
-	func _init(p : FlexNode, fl : Control):
-		super._init(p, fl)
-		type = "FlexSplit"
+	func _init(p : FlexNode, fl : FlexLayout):
+		super._init(p, fl, "FlexSplit")
+	
+	func _notification(what):
+		if what == NOTIFICATION_PREDELETE:
+			for d in draggers:
+				if is_instance_valid(d):
+					d.queue_free()
+	
+	func get_minimum_size() -> Vector2i:
+		var s : Vector2i
+		if vertical:
+			s = Vector2i(0, (10*children.size()-1))
+			for c in children:
+				var ms : Vector2i = c.get_minimum_size()
+				s.x = max(s.x, ms.x)
+				s.y += ms.y
+		else:
+			s = Vector2i(10*(children.size()-1), 0)
+			for c in children:
+				var ms : Vector2i = c.get_minimum_size()
+				s.x += ms.x
+				s.y = max(s.y, ms.y)
+		return s
+	
+	func serialize() -> Dictionary:
+		var rv : Dictionary = super.serialize()
+		rv.dir = "v" if vertical else "h"
+		return rv
+	
+	func deserialize(data : Dictionary):
+		super.deserialize(data)
+		vertical = data.dir == "v"
+		children.clear()
+		for c in data.children:
+			children.append(flexible_layout.deserialize(self, c))
 	
 	func get_children() -> Array[FlexNode]:
 		return children
@@ -117,37 +164,36 @@ class FlexSplit:
 				ref.rect.size.x /= 2
 			fn.rect = ref.rect
 		children.insert(index, fn)
-		fn.parent = self
+		fn.parent = weakref(self)
 	
 	func replace(fn : FlexNode, new_fn : FlexNode) -> bool:
 		var index : int = children.find(fn)
 		if index == -1:
-			print("Error replacing FlexNode")
+			print("Error replacing FlexNode in FlexSplit")
 			return false
 		children.remove_at(index)
 		if new_fn:
 			new_fn.rect = fn.rect
 			children.insert(index, new_fn)
-			new_fn.parent = self
+			new_fn.parent = weakref(self)
 		if children.size() == 1:
-			parent.replace(self, children[0])
+			parent.get_ref().replace(self, children[0])
 			children.remove_at(0)
 			for d in draggers:
 				d.queue_free()
 		return true
 	
 	func layout(r : Rect2):
-		print("Layout FlexSplit (%d children) - %s" % [ children.size(), str(r) ])
+		#print("Layout FlexSplit (%d children) - %s" % [ children.size(), str(r) ])
 		var grip_size : int = 10
 		rect = r
 		var children_count : int = children.size()
 		var draggers_count : int = draggers.size()
 		if draggers_count < children_count-1:
 			for i in children_count-1-draggers_count:
-				print("Creating dragger")
 				var dragger = DRAGGER_SCENE.instantiate()
 				draggers.append(dragger)
-				flexible_layout.add_child(dragger)
+				flexible_layout.control.add_child(dragger)
 		elif draggers_count > children_count-1:
 			while draggers.size() > children_count-1:
 				draggers.pop_back().queue_free()
@@ -187,7 +233,17 @@ class FlexSplit:
 				var width : int = (c.rect.size.x*new_width+(old_width>>1))/old_width
 				c.layout(Rect2(x, r.position.y, width, r.size.y))
 				x += width
-		
+	
+	func start_drag(dragger_index : int, p : int) -> Vector2i:
+		var c1 = children[dragger_index]
+		var c2 = children[dragger_index+1]
+		var min_c1_size : Vector2i = c1.get_minimum_size()
+		var min_c2_size : Vector2i = c2.get_minimum_size()
+		if vertical:
+			return Vector2i(c1.rect.position.y+min_c1_size.y, c2.rect.position.y+c2.rect.size.y-min_c2_size.y-10)
+		else:
+			return Vector2i(c1.rect.position.x+min_c1_size.x, c2.rect.position.x+c2.rect.size.x-min_c2_size.x-10)
+
 	func drag(dragger_index : int, p : int):
 		var c1 = children[dragger_index]
 		var c2 = children[dragger_index+1]
@@ -201,73 +257,350 @@ class FlexSplit:
 
 class FlexTab:
 	extends FlexNode
-	var children : Array[FlexPanel] = []
 	var tabs : Control
+	var adding : bool = false
 	
 	const TAB_SCENE = preload("res://addons/flexible_layout/flexible_tabs.tscn")
 	
-	func _init(p : FlexNode, fl : Control):
-		super._init(p, fl)
-		type = "FlexTab"
-		assert(flexible_layout != null)
+	func _init(p : FlexNode, fl : FlexLayout):
+		assert(p != null)
+		super._init(p, fl, "FlexTab")
 		tabs = TAB_SCENE.instantiate()
-		flexible_layout.add_child(tabs)
+		flexible_layout.control.add_child(tabs)
 		tabs.set_flex_tab(self)
 	
-	func add(fp : FlexPanel):
-		children.push_back(fp)
+	func _notification(what):
+		if what == NOTIFICATION_PREDELETE:
+			if is_instance_valid(tabs):
+				tabs.queue_free()
+	
+	func get_minimum_size() -> Vector2i:
+		var s : Vector2i = Vector2i(0, 0)
+		for t : Control in tabs.get_controls():
+			var ms : Vector2i = t.get_combined_minimum_size()
+			s.x = max(s.x, ms.x)
+			s.y = max(s.y, ms.y)
+		s.y += tabs.get_combined_minimum_size().y
+		return s
+	
+	func serialize() -> Dictionary:
+		var rv : Dictionary = super.serialize()
+		rv.tabs = []
+		for t in tabs.get_controls():
+			rv.tabs.append(t.name)
+		rv.current = tabs.current
+		return rv
+	
+	func deserialize(data : Dictionary):
+		super.deserialize(data)
+		for c in data.tabs:
+			add(flexible_layout.main_control.panels[c])
+		if data.has("current"):
+			tabs.set_current(data.current)
+	
+	func add(fp : Control):
+		adding = true
+		if fp.has_meta("flex_node"):
+			var current_owner = fp.get_meta("flex_node")
+			current_owner.remove(fp)
+			fp.remove_meta("flex_node")
+		assert(not fp.has_meta("flex_node"))
 		tabs.add(fp)
-		if fp.widget.get_parent() != flexible_layout:
-			flexible_layout.add_child(fp.widget)
+		if fp.get_parent() != flexible_layout.control:
+			if fp.get_parent() != null:
+				fp.get_parent().remove_child(fp)
+			flexible_layout.control.add_child(fp)
+		fp.set_meta("flex_node", self)
+		adding = false
 	
-	func remove(fp : FlexPanel):
-		children.erase(fp)
+	func remove(fp : Control):
+		assert(fp.get_meta("flex_node") == self)
 		tabs.erase(fp)
-		if children.is_empty():
+		fp.remove_meta("flex_node")
+		if not adding and tabs.get_controls().is_empty():
 			tabs.queue_free()
-			parent.replace(self, null)
+			parent.get_ref().replace(self, null)
 	
-	func set_current(fp : FlexPanel):
-		tabs.set_current(tabs.controls.find(fp))
+	func set_current(fp : Control):
+		tabs.set_current(tabs.get_control_index(fp))
 	
 	func layout(r : Rect2):
-		print("Layout FlexTab - "+str(r))
+		#print("Layout FlexTab - "+str(r))
 		rect = r
 		tabs.position = rect.position
 		tabs.size = Vector2i(rect.size.x, 0)
 		var tabs_height : int = tabs.get_combined_minimum_size().y
-		for c in children:
-			c.widget.position = rect.position+Vector2(0, tabs.get_combined_minimum_size().y)
-			c.widget.size = rect.size-Vector2(0, tabs.get_combined_minimum_size().y)
+		for c : Control in tabs.get_controls():
+			c.anchor_left = 0
+			c.anchor_right = 0
+			c.anchor_top = 0
+			c.anchor_bottom = 0
+			c.position = rect.position+Vector2(0, tabs_height)
+			c.size = rect.size-Vector2(0, tabs_height)
 
 
 class FlexMain:
 	extends FlexNode
-	var child : FlexPanel = null
+	var child : Control = null
 	
-	func _init(p : FlexNode = null, fl : Control = null):
+	func _init(p : FlexNode = null, fl : FlexLayout = null):
 		super._init(p, fl)
 		type = "FlexMain"
 	
-	func add(fp : FlexPanel):
-		assert(child == null)
+	func get_minimum_size() -> Vector2i:
+		return child.get_combined_minimum_size()
+	
+	func deserialize(data : Dictionary):
+		super.deserialize(data)
+		add(flexible_layout.main_control.panels["Main"])
+	
+	func add(fp : Control):
+		#assert(child == null)
 		child = fp
-		if fp.widget.get_parent() != flexible_layout:
-			flexible_layout.add_child(fp.widget)
+		fp.set_meta("flex_node", self)
+		if fp.get_parent() != flexible_layout.control:
+			flexible_layout.control.add_child(fp)
 	
 	func layout(r : Rect2):
-		print("Layout FlexNode - "+str(r))
+		#print("Layout FlexNode - "+str(r))
 		rect = r
-		child.widget.position = rect.position
-		child.widget.size = rect.size
+		child.anchor_left = 0
+		child.anchor_right = 0
+		child.anchor_top = 0
+		child.anchor_bottom = 0
+		child.position = rect.position
+		child.size = rect.size
 
+class FlexLayout:
+	var main_control : Control
+	var control : Control
+	var top : FlexTop = null
+	
+	func _init(m, c):
+		main_control = m
+		control = c
+	
+	func serialize() -> Dictionary:
+		return top.serialize()
+	
+	func deserialize(parent : FlexNode, data : Dictionary) -> FlexNode:
+		var fn : FlexNode
+		match data.type:
+			"FlexTop":
+				fn = FlexTop.new(self)
+			"FlexMain":
+				fn = FlexMain.new(parent, self)
+			"FlexSplit":
+				fn = FlexSplit.new(parent, self)
+			"FlexTab":
+				fn = FlexTab.new(parent, self)
+			_:
+				print(data.type)
+				assert(false)
+		fn.deserialize(data)
+		return fn
+	
+	func get_flexnode_at(p : Vector2) -> FlexNode:
+		return top.get_flexnode_at(p)
+	
+	func get_flexmain(p : FlexNode = top) -> FlexMain:
+		for c in p.get_children():
+			if c is FlexMain:
+				return c
+		for c in p.get_children():
+			var rv : FlexMain = get_flexmain(c)
+			if rv != null:
+				return rv
+		var main : FlexMain = FlexMain.new(top, top.flexible_layout)
+		if top.child == null:
+			top.set_child(main)
+		else:
+			if not top.child is FlexSplit:
+				var flex_split : FlexSplit = FlexSplit.new(top, top.flexible_layout)
+				flex_split.rect = top.child.rect
+				flex_split.insert(top.child)
+				top.set_child(flex_split)
+			top.child.insert(main)
+		return main
+
+	func get_default_flextab(p : FlexNode = top) -> FlexTab:
+		for c in p.get_children():
+			if c is FlexTab:
+				return c
+		for c in p.get_children():
+			var rv : FlexTab = get_default_flextab(c)
+			if rv != null:
+				return rv
+		var tab : FlexTab = FlexTab.new(top, top.flexible_layout)
+		if top.child == null:
+			top.set_child(tab)
+		else:
+			if not top.child is FlexSplit:
+				var flex_split : FlexSplit = FlexSplit.new(top, top.flexible_layout)
+				flex_split.rect = top.child.rect
+				flex_split.insert(top.child)
+				top.set_child(flex_split)
+			top.child.insert(tab)
+		return tab
+	
+	func is_panel_shown(panel_name : String) -> bool:
+		var panel : Control = main_control.panels[panel_name]
+		return (panel and panel.has_meta("flex_node"))
+	
+	func show_panel(panel_name : String):
+		var panel : Control = main_control.panels[panel_name]
+		if panel.has_meta("flex_node"):
+			return
+		if panel_name == "Main":
+			get_flexmain().add(panel)
+		else:
+			get_default_flextab().add(panel)
+	
+	func init(layout = null):
+		var default_flextab : FlexTab = null
+		if layout != null:
+			top = deserialize(null, layout)
+		elif main_control == control:
+			if top == null:
+				top = FlexTop.new(self)
+			for panel_name in main_control.panels.keys():
+				show_panel(panel_name)
+		layout()
+	
+	func layout():
+		var rect : Rect2i = control.get_rect()
+		if rect.size.x == 0 or rect.size.y == 0:
+			return
+		if top:
+			rect.size = Vector2i(Vector2(rect.size))
+			top.layout(rect)
+		main_control.layout_changed.emit()
+	
+	func move_panel(panel, reference_panel : FlexNode, destination : int, test_only : bool = false) -> bool:
+		var parent_panel : FlexNode = reference_panel.parent.get_ref() as FlexNode
+		# if current container has only 1 tab, it cannot be dropped into or near itself
+		var into_same_tab : bool = false
+		if reference_panel is FlexTab and reference_panel == panel.flex_panel.get_meta("flex_node"):
+			into_same_tab = true
+			if reference_panel.tabs.get_controls().size() == 1:
+				return false
+		var vertical : bool
+		var offset : int
+		var tab : FlexTab = null
+		match destination:
+			0:
+				if not reference_panel is FlexTab or into_same_tab:
+					return false
+				tab = reference_panel
+			1:
+				vertical = true
+				offset = 0
+			2:
+				vertical = false
+				offset = 0
+			3:
+				vertical = false
+				offset = 1
+			4:
+				vertical = true
+				offset = 1
+			_:
+				return false
+		if not test_only:
+			if tab == null:
+				var split : FlexSplit
+				if parent_panel is FlexSplit and parent_panel.vertical == vertical:
+					split = parent_panel as FlexSplit
+				else:
+					split = FlexSplit.new(parent_panel, reference_panel.flexible_layout)
+					split.vertical = vertical
+					parent_panel.replace(reference_panel, split)
+					split.insert(reference_panel, 0)
+				tab = FlexTab.new(parent_panel, reference_panel.flexible_layout)
+				var ref_index : int = split.find(reference_panel)
+				split.insert(tab, ref_index+offset, ref_index)
+			tab.add(panel.flex_panel)
+			layout()
+		return true
+
+	func undock(panel : Control):
+		main_control.subwindows.append(FlexWindow.new(main_control, panel))
+		layout()
+	
+	func delete_subwindow():
+		if control == main_control:
+			return
+		var subwindow : FlexWindow = control.get_window()
+		main_control.subwindows.erase(subwindow)
+		subwindow.queue_free()
 
 class FlexWindow:
 	extends Window
+	
+	var panel : Control
+	var flex_layout : FlexLayout
+	var overlay : Control
+	
+	func _init(main_control : Control, first_panel : Control = null):
+		if first_panel:
+			position = Vector2i(first_panel.get_global_rect().position)+first_panel.get_window().position
+			size = first_panel.size
+			theme = main_control.owner.theme
+		panel = Control.new()
+		add_child(panel)
+		panel.position = Vector2i(0, 0)
+		panel.size = size
+		flex_layout = FlexLayout.new(main_control, panel)
+		main_control.get_viewport().add_child(self)
+		if first_panel:
+			flex_layout.init({children=[{type="FlexTab",tabs=[first_panel.name],current=0,h=768,w=288,children=[]}],type="FlexTop",h=768,w=1024})
+			resize()
+	
+	func _ready():
+		self.size_changed.connect(self.resize)
+	
+	func resize():
+		panel.position = Vector2i(0, 0)
+		panel.size = size
+		flex_layout.layout()
+	
+	func serialize() -> Dictionary:
+		var data : Dictionary = {}
+		data.screen = current_screen
+		data.x = position.x
+		data.y = position.y
+		data.w = size.x
+		data.h = size.y
+		data.layout = flex_layout.serialize()
+		return data
+	
+	func init(data : Dictionary):
+		if data.has("screen"):
+			current_screen = data.screen
+		else:
+			current_screen = 0
+		position = Vector2i(data.x, data.y)
+		size = Vector2i(data.w, data.h)
+		flex_layout.init(data.layout)
+		resize()
+	
+	func start_drag():
+		overlay = OVERLAY_SCENE.instantiate()
+		overlay.position = Vector2(0, 0)
+		overlay.size = panel.size
+		overlay.flex_layout = flex_layout
+		panel.add_child(overlay)
+	
+	func end_drag():
+		overlay.queue_free()
+		overlay = null
 
 
-var top : FlexTop = null
-var unassigned : Array = []
+@export var allow_undock : bool = false
+
+var panels : Dictionary = {}
+var flex_layout : FlexLayout
+var subwindows : Array[Window]
 
 var overlay : Control
 
@@ -275,131 +608,89 @@ var overlay : Control
 const OVERLAY_SCENE = preload("res://addons/flexible_layout/flexible_overlay.tscn")
 
 
+signal layout_changed
+
+
+func _init():
+	flex_layout = FlexLayout.new(self, self)
+
 func _ready():
 	var children = get_children()
 	for c in children:
 		if c.visible and ! c.has_meta("flexlayout"):
 			add(c.name, c)
-	await get_tree().process_frame
-	layout()
 
-func get_flexmain(p : FlexNode = top) -> FlexMain:
-	for c in p.get_children():
-		if c is FlexTab:
-			return c
-	for c in p.get_children():
-		var rv : FlexMain = get_flexmain(c)
-		if rv != null:
-			return rv
-	var main : FlexMain = FlexMain.new(top, top.flexible_layout)
-	if top.child == null:
-		top.set_child(main)
-	else:
-		if not top.child is FlexSplit:
-			var flex_split : FlexSplit = FlexSplit.new(top, top.flexible_layout)
-			flex_split.rect = top.child.rect
-			flex_split.insert(top.child)
-			top.set_child(flex_split)
-		top.child.insert(main)
-	return main
-
-func get_default_flextab(p : FlexNode = top) -> FlexTab:
-	for c in p.get_children():
-		if c is FlexTab:
-			return c
-	for c in p.get_children():
-		var rv : FlexTab = get_default_flextab(c)
-		if rv != null:
-			return rv
-	var tab : FlexTab = FlexTab.new(top, top.flexible_layout)
-	if top.child == null:
-		top.set_child(tab)
-	else:
-		if not top.child is FlexSplit:
-			var flex_split : FlexSplit = FlexSplit.new(top, top.flexible_layout)
-			flex_split.rect = top.child.rect
-			flex_split.insert(top.child)
-			top.set_child(flex_split)
-		top.child.insert(tab)
-	return tab
-
-func layout():
-	var default_flextab : FlexTab = null
-	print("layout")
-	if top == null:
-		print("creating top")
-		top = FlexTop.new(self)
-	for fp in unassigned:
-		if fp.name == "Main":
-			get_flexmain().add(fp)
-		else:
-			if default_flextab == null:
-				default_flextab = get_default_flextab()
-			default_flextab.add(fp)
-	unassigned = []
-	top.layout(get_rect())
-	print("done")
+func _notification(what):
+	match what:
+		NOTIFICATION_THEME_CHANGED:
+			var new_theme = null
+			var control = self
+			while control:
+				if control is Control and control.theme != null:
+					new_theme = control.theme
+					break
+				control = control.get_parent()
+			if new_theme != null:
+				for w in subwindows:
+					for c in w.get_children():
+						if c is Control:
+							c.theme = new_theme
 
 func add(n : String, c : Control):
-	var fp = FlexPanel.new()
-	fp.name = n
-	fp.widget = c
-	unassigned.push_back(fp)
+	c.name = n
+	c.set_meta("flex_layout", self)
+	panels[n] = c
 
-func _on_resized():
-	print("resized")
-	layout()
+func init(layout = null):
+	for p in panels.keys():
+		show_panel(p, false)
+	if layout and layout.has("main"):
+		for w in layout.windows:
+			var subwindow = FlexWindow.new(self)
+			subwindow.init(w)
+			subwindows.append(subwindow)
+		flex_layout.init(layout.main)
+	else:
+		flex_layout.init(layout)
+
+func layout():
+	flex_layout.layout()
+	for w in subwindows:
+		w.flex_layout.layout()
+
+func show_panel(panel_name : String, v : bool = true):
+	if v:
+		flex_layout.show_panel(panel_name)
+	else:
+		if panel_name == "Main":
+			return
+		var panel : Control = panels[panel_name]
+		if panel.has_meta("flex_node"):
+			var flex_node = panel.get_meta("flex_node")
+			flex_node.remove(panel)
+
+func serialize() -> Dictionary:
+	var data : Dictionary = {}
+	data.main = flex_layout.serialize()
+	data.windows = []
+	for w in subwindows:
+		data.windows.append(w.serialize())
+	return data
 
 func start_drag():
-	print("Starting drag")
 	overlay = OVERLAY_SCENE.instantiate()
 	overlay.position = Vector2(0, 0)
 	overlay.size = size
+	overlay.flex_layout = flex_layout
 	add_child(overlay)
+	for w in subwindows:
+		w.start_drag()
 
 func end_drag():
 	overlay.queue_free()
 	overlay = null
+	for w in subwindows:
+		w.end_drag()
 
-func get_flexnode_at(p : Vector2) -> FlexNode:
-	return top.get_flexnode_at(p)
-
-func move_panel(panel, reference_panel : FlexNode, destination):
-	var parent_panel : FlexNode = reference_panel.parent
-	var vertical : bool
-	var offset : int
-	var tab : FlexTab = null
-	match destination:
-		0:
-			if not reference_panel is FlexTab:
-				return
-			tab = reference_panel
-		1:
-			vertical = true
-			offset = 0
-		2:
-			vertical = false
-			offset = 0
-		3:
-			vertical = false
-			offset = 1
-		4:
-			vertical = true
-			offset = 1
-		_:
-			return
-	if tab == null:
-		var split : FlexSplit
-		if parent_panel is FlexSplit and parent_panel.vertical == vertical:
-			split = parent_panel as FlexSplit
-		else:
-			split = FlexSplit.new(parent_panel, reference_panel.flexible_layout)
-			split.vertical = vertical
-			parent_panel.replace(reference_panel, split)
-			split.insert(reference_panel, 0)
-		tab = FlexTab.new(parent_panel, reference_panel.flexible_layout)
-		var ref_index : int = split.find(reference_panel)
-		split.insert(tab, ref_index+offset, ref_index)
-	panel.flex_node.remove(panel.flex_panel)
-	tab.add(panel.flex_panel)
-	layout()
+func _on_resized():
+	flex_layout.layout()
